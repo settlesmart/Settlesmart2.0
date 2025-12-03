@@ -3,55 +3,23 @@ import { NextResponse } from "next/server";
 export const runtime = "nodejs";
 
 export async function POST(req) {
-  const body = await req.json();
+  const apiKey = process.env.OPENAI_API_KEY;
 
+  // If the key is missing, return a clear error (and log it)
+  if (!apiKey) {
+    console.error("Missing OPENAI_API_KEY in environment");
+    return NextResponse.json(
+      { error: "Server is missing OpenAI API key." },
+      { status: 500 }
+    );
+  }
+
+  const body = await req.json();
   const { phase, origin, destination, visaType, anchorDate } = body;
 
-  const schema = {
-    name: "RelocationPlan",
-    schema: {
-      type: "object",
-      properties: {
-        weeks: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              title: { type: "string" },
-              items: {
-                type: "array",
-                items: {
-                  type: "object",
-                  properties: {
-                    label: { type: "string" },
-                    daysOffset: { type: "number" },
-                    category: { type: "string" },
-                  },
-                  required: ["label", "daysOffset"],
-                },
-              },
-            },
-            required: ["title", "items"],
-          },
-        },
-        countryNotes: { type: "string" },
-      },
-      required: ["weeks"],
-    },
-  };
-
-  const prompt = `
-You are an immigration & relocation onboarding assistant.
-
-User profile:
-- Phase: ${phase}
-- From: ${origin}
-- To: ${destination}
-- Visa type: ${visaType}
-- Anchor date: ${anchorDate}
-
-Return a 4-week plan of tasks aligned to their first 30–60 days
-(before or after arrival depending on phase). Include tasks for:
+  const systemPrompt = `
+You are an immigration and relocation onboarding assistant.
+You create practical 4 week checklists for newcomers that cover:
 
 - Phone/SIM and 2FA
 - Banking and payments
@@ -61,43 +29,77 @@ Return a 4-week plan of tasks aligned to their first 30–60 days
 - School/university or employer onboarding if relevant
 - Taxes and basic legal registrations
 
-Each task must be clear and atomic. Use daysOffset relative to the anchor date.
-Add a short countryNotes paragraph with practical tips for the destination.
-`;
+Return JSON only. No prose, no extra text.
+JSON shape:
+{
+  "weeks": [
+    { "title": "Week 1", "items": [ { "label": "...", "daysOffset": 0, "category": "phone" } ] },
+    ...
+  ],
+  "countryNotes": "short practical tips for this corridor"
+}
+  `.trim();
 
-  const res = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4.1-mini",
-      input: prompt,
-      response_format: { type: "json_schema", json_schema: schema },
-    }),
-  });
+  const userPrompt = `
+Phase: ${phase}
+From: ${origin}
+To: ${destination}
+Visa type: ${visaType}
+Anchor date: ${anchorDate}
 
-  if (!res.ok) {
-    const text = await res.text();
-    console.error("OpenAI error:", text);
-    return NextResponse.json({ error: "OpenAI error" }, { status: 500 });
-  }
+Create a 4 week plan aligned to their first 30–60 days (before or after arrival depending on phase).
+Use sensible daysOffset (0–30). Tasks must be clear and atomic.
+  `.trim();
 
-  const data = await res.json();
-
-  const raw =
-    data.output?.[0]?.content?.[0]?.text ??
-    data.choices?.[0]?.message?.content ??
-    "{}";
-
-  let plan;
   try {
-    plan = JSON.parse(raw);
-  } catch (e) {
-    console.error("JSON parse error:", e);
-    plan = { weeks: [], countryNotes: "" };
-  }
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.5,
+      }),
+    });
 
-  return NextResponse.json(plan);
+    if (!response.ok) {
+      const text = await response.text();
+      console.error("OpenAI error:", text);
+      return NextResponse.json(
+        { error: "OpenAI error from backend." },
+        { status: 500 }
+      );
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content ?? "{}";
+
+    let plan;
+    try {
+      plan = JSON.parse(content);
+    } catch (e) {
+      console.error("JSON parse error:", e, "content:", content);
+      // Fallback: return an empty but valid structure
+      plan = {
+        weeks: [],
+        countryNotes:
+          "We could not parse the AI response. Please try again or contact support.",
+      };
+    }
+
+    return NextResponse.json(plan);
+  } catch (err) {
+    console.error("Unhandled error in /api/plan:", err);
+    return NextResponse.json(
+      { error: "Unexpected server error." },
+      { status: 500 }
+    );
+  }
 }
